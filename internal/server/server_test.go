@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestServerHealthzHTTP(t *testing.T) {
@@ -308,16 +309,29 @@ func TestCreateTask_ValidatesWorkspaceBindings(t *testing.T) {
 }
 
 type fakeReconciler struct {
-	reconcileCount int
-	reconcileErr   error
-	deleteCount    int
-	deleteErr      error
-	onDelete       func(ctx context.Context, atespace, taskName string) error
+	reconcileCount      int
+	reconcileErr        error
+	reconcilePhase      string
+	reconcileConditions []*v1alpha1.Condition
+	observedTask        *v1alpha1.Task
+	deleteCount         int
+	deleteErr           error
+	onDelete            func(ctx context.Context, atespace, taskName string) error
 }
 
 func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
 	f.reconcileCount++
+	f.observedTask = proto.Clone(task).(*v1alpha1.Task)
 	if f.reconcileErr != nil {
+		if task.Status == nil {
+			task.Status = &v1alpha1.TaskStatus{}
+		}
+		if f.reconcilePhase != "" {
+			task.Status.Phase = f.reconcilePhase
+		}
+		if f.reconcileConditions != nil {
+			task.Status.Conditions = f.reconcileConditions
+		}
 		return task, f.reconcileErr
 	}
 	task.Status = &v1alpha1.TaskStatus{
@@ -651,5 +665,121 @@ func TestServer_CreateTask_ReconcileErrorMarksFailed(t *testing.T) {
 	})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition on duplicate create, got %v", err)
+	}
+}
+
+func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
+	st := memory.NewStore()
+	rec := &fakeReconciler{
+		reconcileErr:   status.Error(codes.Unavailable, "connection refused"),
+		reconcilePhase: "Pending",
+		reconcileConditions: []*v1alpha1.Condition{
+			{Type: "Ready", Status: "False", Reason: "SubstrateUnavailable"},
+		},
+	}
+	srv := server.NewServer(st, server.Options{Reconciler: rec})
+	ctx := context.Background()
+
+	// 1. CreateTask while Substrate is unavailable records Phase="Pending" (not "Failed")
+	// and returns codes.Unavailable.
+	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable from CreateTask when Substrate is unreachable, got %v", err)
+	}
+
+	stored, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "simple-task"})
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	if stored.GetStatus().GetPhase() != "Pending" {
+		t.Errorf("expected stored phase 'Pending' after transient Substrate error, got %q", stored.GetStatus().GetPhase())
+	}
+
+	// 2. Re-applying a Pending task with a different spec is rejected to preserve immutability.
+	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "debian"},
+		},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition when re-applying Pending task with modified spec, got %v", err)
+	}
+
+	// 3. Re-applying a Pending task with omitted status preserves stored status conditions
+	// rather than dropping them before reconciliation.
+	rec.reconcileConditions = nil
+	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable on retry while Substrate is still down, got %v", err)
+	}
+	if conds := rec.observedTask.GetStatus().GetConditions(); len(conds) != 1 || conds[0].GetReason() != "SubstrateUnavailable" {
+		t.Errorf("expected stored condition SubstrateUnavailable to be preserved on omitted-status retry, got %v", conds)
+	}
+
+	// 4. Re-applying a Pending task with client-supplied conditions reuses the stored task
+	// rather than overwriting status with client-supplied values.
+	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Status: &v1alpha1.TaskStatus{
+				Phase: "Running",
+				Conditions: []*v1alpha1.Condition{
+					{Type: "Ready", Status: "True", Reason: "ClientForged"},
+				},
+			},
+		},
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable on retry while Substrate is still down, got %v", err)
+	}
+	if conds := rec.observedTask.GetStatus().GetConditions(); len(conds) != 1 || conds[0].GetReason() != "SubstrateUnavailable" {
+		t.Errorf("expected client-supplied conditions to be ignored on Pending retry, got %v", conds)
+	}
+
+	// 5. Once Substrate recovers, re-applying CreateTask with the unchanged spec succeeds
+	// for a Pending task and transitions it to Suspended.
+	rec.reconcileErr = nil
+	rec.reconcilePhase = ""
+	created, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTask retry after Substrate recovery failed: %v", err)
+	}
+	if created.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("expected phase 'Suspended' after recovery, got %q", created.GetStatus().GetPhase())
+	}
+	if !created.GetMetadata().GetCreationTimestamp().AsTime().Equal(stored.GetMetadata().GetCreationTimestamp().AsTime()) {
+		t.Errorf("expected CreationTimestamp to be preserved across Pending re-apply")
+	}
+
+	// 6. ResumeTask during a brief Substrate outage keeps the task Pending instead of Failed.
+	rec.reconcileErr = status.Error(codes.Unavailable, "substrate restarting")
+	rec.reconcilePhase = "Pending"
+	_, err = srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "simple-task"})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable from ResumeTask when Substrate is unreachable, got %v", err)
+	}
+	storedAfterResumeErr, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "simple-task"})
+	if err != nil {
+		t.Fatalf("GetTask failed: %v", err)
+	}
+	if storedAfterResumeErr.GetStatus().GetPhase() != "Pending" {
+		t.Errorf("expected stored phase 'Pending' after transient ResumeTask error, got %q", storedAfterResumeErr.GetStatus().GetPhase())
 	}
 }

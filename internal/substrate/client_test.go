@@ -413,4 +413,36 @@ func TestRetryOnCodes(t *testing.T) {
 			t.Errorf("expected context.Canceled, got %v", err)
 		}
 	})
+
+	t.Run("retries Unavailable and succeeds", func(t *testing.T) {
+		calls := 0
+		err := retryOnCodes(context.Background(), func() error {
+			calls++
+			if calls < 3 {
+				return status.Error(codes.Unavailable, "ateapi rolling out")
+			}
+			return nil
+		}, codes.Unavailable)
+		if err != nil || calls != 3 {
+			t.Errorf("got err=%v calls=%d, want nil after 3 calls", err, calls)
+		}
+	})
+}
+
+func TestIsTransientError(t *testing.T) {
+	if IsTransientError(nil) {
+		t.Error("expected nil error to be non-transient")
+	}
+	if !IsTransientError(status.Error(codes.Unavailable, "connection refused")) {
+		t.Error("expected codes.Unavailable to be transient")
+	}
+	if !IsTransientError(status.Error(codes.DeadlineExceeded, "rpc deadline exceeded")) {
+		t.Error("expected codes.DeadlineExceeded to be transient")
+	}
+	if !IsTransientError(context.DeadlineExceeded) {
+		t.Error("expected context.DeadlineExceeded to be transient")
+	}
+	if IsTransientError(status.Error(codes.InvalidArgument, "bad spec")) {
+		t.Error("expected codes.InvalidArgument to be non-transient")
+	}
 }

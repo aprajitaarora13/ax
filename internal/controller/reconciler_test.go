@@ -35,18 +35,21 @@ import (
 
 type mockControlServer struct {
 	ateapipb.UnimplementedControlServer
-	workerIP         string
-	createdAtespaces []string
-	createdActors    []string
-	resumedActors    []string
-	suspendedActors  []string
-	suspendErr       error
-	deletedActors    []string
-	actorTemplates   map[string]bool
-	deletedTemplates []string
-	getActorFunc     func(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error)
-	crashedActor     string
-	revertedActors   []string
+	workerIP          string
+	createdAtespaces  []string
+	createdActors     []string
+	resumedActors     []string
+	suspendedActors   []string
+	suspendErr        error
+	deletedActors     []string
+	actorTemplates    map[string]bool
+	deletedTemplates  []string
+	getActorFunc      func(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error)
+	createAtespaceErr error
+	createActorErr    error
+	resumeActorErr    error
+	crashedActor      string
+	revertedActors    []string
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -72,6 +75,9 @@ func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb
 }
 
 func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.CreateAtespaceRequest) (*ateapipb.Atespace, error) {
+	if m.createAtespaceErr != nil {
+		return nil, m.createAtespaceErr
+	}
 	name := ""
 	if req.Atespace != nil && req.Atespace.Metadata != nil {
 		name = req.Atespace.Metadata.Name
@@ -81,6 +87,9 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 }
 
 func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
+	if m.createActorErr != nil {
+		return nil, m.createActorErr
+	}
 	name := ""
 	if req.Actor != nil && req.Actor.Metadata != nil {
 		name = req.Actor.Metadata.Name
@@ -98,6 +107,9 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
+	if m.resumeActorErr != nil {
+		return nil, m.resumeActorErr
+	}
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
@@ -679,4 +691,105 @@ func TestEnsureActor_RevertsCrashedActor(t *testing.T) {
 	if len(mockSrv.revertedActors) != 1 || len(mockSrv.deletedActors) != 0 {
 		t.Errorf("crashed actor: reverted %v, deleted %v; want reverted only", mockSrv.revertedActors, mockSrv.deletedActors)
 	}
+}
+
+func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
+	ctx := context.Background()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace)
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+
+	// 1. Transient error during EnsureAtespace leaves Task in Phase="Pending" with Reason="SubstrateUnavailable".
+	mockSrv.createAtespaceErr = status.Error(codes.DeadlineExceeded, "substrate control plane timed out")
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "transient-atespace"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	reconciled, err := reconciler.Reconcile(ctx, task)
+	if err == nil {
+		t.Fatal("expected error from Reconcile when EnsureAtespace fails, got nil")
+	}
+	if reconciled.GetStatus().GetPhase() != "Pending" {
+		t.Errorf("expected Phase='Pending' on transient EnsureAtespace error, got %q", reconciled.GetStatus().GetPhase())
+	}
+	assertCondition(t, reconciled, "Ready", "False", "SubstrateUnavailable")
+	mockSrv.createAtespaceErr = nil
+
+	// 2. Transient error during EnsureActor leaves Task in Phase="Pending" with Reason="SubstrateUnavailable".
+	mockSrv.createActorErr = status.Error(codes.DeadlineExceeded, "substrate actor creation timed out")
+	task2 := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "transient-actor"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	reconciled2, err := reconciler.Reconcile(ctx, task2)
+	if err == nil {
+		t.Fatal("expected error from Reconcile when EnsureActor fails, got nil")
+	}
+	if reconciled2.GetStatus().GetPhase() != "Pending" {
+		t.Errorf("expected Phase='Pending' on transient EnsureActor error, got %q", reconciled2.GetStatus().GetPhase())
+	}
+	assertCondition(t, reconciled2, "Ready", "False", "SubstrateUnavailable")
+	mockSrv.createActorErr = nil
+
+	// 3. Transient error during ResumeActor leaves Task in Phase="Pending" with Reason="SubstrateUnavailable",
+	// and a subsequent Reconcile once Substrate recovers transitions the Task to "Running".
+	mockSrv.resumeActorErr = status.Error(codes.DeadlineExceeded, "substrate worker pool temporarily unreachable")
+	task3 := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "transient-resume"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+		Status:   &v1alpha1.TaskStatus{Phase: "Running"},
+	}
+	reconciled3, err := reconciler.Reconcile(ctx, task3)
+	if err == nil {
+		t.Fatal("expected error from Reconcile when ResumeActor fails, got nil")
+	}
+	if reconciled3.GetStatus().GetPhase() != "Pending" {
+		t.Errorf("expected Phase='Pending' on transient ResumeActor error, got %q", reconciled3.GetStatus().GetPhase())
+	}
+	assertCondition(t, reconciled3, "Ready", "False", "SubstrateUnavailable")
+
+	// Recovery on retry:
+	mockSrv.resumeActorErr = nil
+	reconciled3.Status.Phase = "Running"
+	recovered, err := reconciler.Reconcile(ctx, reconciled3)
+	if err != nil {
+		t.Fatalf("expected Reconcile to succeed after Substrate recovers, got %v", err)
+	}
+	if recovered.GetStatus().GetPhase() != "Running" {
+		t.Errorf("expected Phase='Running' after recovery, got %q", recovered.GetStatus().GetPhase())
+	}
+
+	// 4. Permanent (non-transient) error still marks Task as Phase="Failed".
+	mockSrv.createActorErr = status.Error(codes.InvalidArgument, "invalid actor specification")
+	task4 := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "permanent-actor-err"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	reconciled4, err := reconciler.Reconcile(ctx, task4)
+	if err == nil {
+		t.Fatal("expected error on InvalidArgument, got nil")
+	}
+	if reconciled4.GetStatus().GetPhase() != "Failed" {
+		t.Errorf("expected Phase='Failed' on permanent error, got %q", reconciled4.GetStatus().GetPhase())
+	}
+	mockSrv.createActorErr = nil
 }

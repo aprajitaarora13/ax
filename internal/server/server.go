@@ -23,10 +23,12 @@ import (
 
 	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/store"
+	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -160,11 +162,14 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	}
 	defer unlock()
 
-	_, err = s.store.GetTask(ctx, atespace, taskName)
+	existing, err := s.store.GetTask(ctx, atespace, taskName)
 	if err == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "task %s/%s already exists and is immutable", atespace, taskName)
+		if existing.GetStatus().GetPhase() != "Pending" || !proto.Equal(existing.GetSpec(), task.GetSpec()) {
+			return nil, status.Errorf(codes.FailedPrecondition, "task %s/%s already exists and is immutable", atespace, taskName)
+		}
+		task = existing
 	}
-	if !errors.Is(err, store.ErrNotFound) {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, status.Errorf(codes.Internal, "checking existing task: %v", err)
 	}
 
@@ -185,8 +190,18 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
 		if err != nil {
 			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
-			task.Status.Phase = "Failed"
+			if reconciled != nil && reconciled.Status != nil {
+				task.Status = reconciled.Status
+			}
+			if substrate.IsTransientError(err) {
+				task.Status.Phase = "Pending"
+			} else if task.Status.Phase != "Pending" {
+				task.Status.Phase = "Failed"
+			}
 			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
+			if substrate.IsTransientError(err) {
+				return nil, status.Errorf(codes.Unavailable, "provisioning task on substrate: %v", err)
+			}
 			return nil, status.Errorf(codes.Internal, "provisioning task on substrate: %v", err)
 		}
 		task.Status = reconciled.Status
@@ -287,6 +302,9 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
 		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
 		if err != nil {
+			if substrate.IsTransientError(err) {
+				return nil, status.Errorf(codes.Unavailable, "suspending task on substrate: %v", err)
+			}
 			return nil, status.Errorf(codes.Internal, "suspending task on substrate: %v", err)
 		}
 		task.Status = reconciled.Status
@@ -335,8 +353,18 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
 		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
 		if err != nil {
-			task.Status.Phase = "Failed"
+			if reconciled != nil && reconciled.Status != nil {
+				task.Status = reconciled.Status
+			}
+			if substrate.IsTransientError(err) {
+				task.Status.Phase = "Pending"
+			} else if task.Status.Phase != "Pending" {
+				task.Status.Phase = "Failed"
+			}
 			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
+			if substrate.IsTransientError(err) {
+				return nil, status.Errorf(codes.Unavailable, "resuming task on substrate: %v", err)
+			}
 			return nil, status.Errorf(codes.Internal, "resuming task on substrate: %v", err)
 		}
 		task.Status = reconciled.Status
@@ -599,4 +627,3 @@ func defaultMetadata(meta *v1alpha1.ObjectMeta, existing func(atespace, name str
 	}
 	return meta
 }
-

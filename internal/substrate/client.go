@@ -188,7 +188,10 @@ func (c *Client) EnsureAtespace(ctx context.Context, atespace string) error {
 			},
 		},
 	}
-	_, err := c.control.CreateAtespace(ctx, req)
+	err := retryOnCodes(ctx, func() error {
+		_, err := c.control.CreateAtespace(ctx, req)
+		return err
+	}, codes.Unavailable)
 	if err != nil && status.Code(err) != codes.AlreadyExists {
 		return fmt.Errorf("creating atespace %q: %w", atespace, err)
 	}
@@ -203,7 +206,13 @@ func (c *Client) GetActorTemplate(ctx context.Context, atespace, templateName st
 			Name:     templateName,
 		},
 	}
-	return c.control.GetActorTemplate(ctx, req)
+	var tmpl *ateapipb.ActorTemplate
+	err := retryOnCodes(ctx, func() error {
+		var err error
+		tmpl, err = c.control.GetActorTemplate(ctx, req)
+		return err
+	}, codes.Unavailable)
+	return tmpl, err
 }
 
 const (
@@ -235,6 +244,24 @@ var (
 	// previous actor is still deleting (actorDeletingWaitAttempts * interval ~= 10s).
 	actorDeletingWaitInterval = 500 * time.Millisecond
 )
+
+// IsTransientError reports whether err represents a transient Substrate
+// control-plane unavailability or timeout rather than a permanent failure.
+func IsTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Unavailable, codes.DeadlineExceeded:
+			return true
+		}
+	}
+	return false
+}
 
 // retryOnCodes calls fn until it succeeds, returns an error whose gRPC code is not in
 // retryable, defaultRetryAttempts is exhausted, or ctx is done. Between attempts it
@@ -344,7 +371,12 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}
-	created, err := c.control.CreateActorTemplate(ctx, req)
+	var created *ateapipb.ActorTemplate
+	err = retryOnCodes(ctx, func() error {
+		var err error
+		created, err = c.control.CreateActorTemplate(ctx, req)
+		return err
+	}, codes.Unavailable)
 	if err != nil && status.Code(err) != codes.AlreadyExists {
 		return nil, fmt.Errorf("creating actor template %s/%s: %w", targetAtespace, targetTemplate, err)
 	}
@@ -368,7 +400,12 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 			},
 		},
 	}
-	actor, err := c.control.CreateActor(ctx, req)
+	var actor *ateapipb.Actor
+	err := retryOnCodes(ctx, func() error {
+		var err error
+		actor, err = c.control.CreateActor(ctx, req)
+		return err
+	}, codes.Unavailable)
 	if err != nil {
 		if status.Code(err) == codes.AlreadyExists {
 			existing, getErr := c.GetActor(ctx, atespace, actorName)
@@ -376,12 +413,17 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 				state := existing.GetStatus().GetState()
 				if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 					// Revert to the last snapshot so the workspace survives the crash.
-					reverted, revertErr := c.control.RevertActor(ctx, &ateapipb.RevertActorRequest{
-						Actor: &ateapipb.ObjectRef{
-							Atespace: atespace,
-							Name:     actorName,
-						},
-					})
+					var reverted *ateapipb.RevertActorResponse
+					revertErr := retryOnCodes(ctx, func() error {
+						var err error
+						reverted, err = c.control.RevertActor(ctx, &ateapipb.RevertActorRequest{
+							Actor: &ateapipb.ObjectRef{
+								Atespace: atespace,
+								Name:     actorName,
+							},
+						})
+						return err
+					}, codes.Unavailable)
 					if revertErr == nil {
 						slog.Warn("existing actor is crashed, reverted to its last snapshot", "actor", actorName)
 						return reverted.GetActor(), nil
@@ -390,7 +432,11 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 					if err := c.DeleteActor(ctx, atespace, actorName); err != nil {
 						return nil, err
 					}
-					actor, err = c.control.CreateActor(ctx, req)
+					err = retryOnCodes(ctx, func() error {
+						var err error
+						actor, err = c.control.CreateActor(ctx, req)
+						return err
+					}, codes.Unavailable)
 					if err == nil {
 						return actor, nil
 					}
@@ -435,7 +481,7 @@ func (c *Client) ResumeActor(ctx context.Context, atespace, actorName string) (*
 		var err error
 		resp, err = c.control.ResumeActor(ctx, req)
 		return err
-	}, codes.Aborted)
+	}, codes.Aborted, codes.Unavailable)
 	if err != nil {
 		return nil, "", fmt.Errorf("resuming actor %s/%s: %w", atespace, actorName, err)
 	}
@@ -460,7 +506,7 @@ func (c *Client) SuspendActor(ctx context.Context, atespace, actorName string) e
 	err := retryOnCodes(ctx, func() error {
 		_, err := c.control.SuspendActor(ctx, req)
 		return err
-	}, codes.Aborted)
+	}, codes.Aborted, codes.Unavailable)
 	if err != nil {
 		return fmt.Errorf("suspending actor %s/%s: %w", atespace, actorName, err)
 	}
@@ -475,7 +521,13 @@ func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ate
 			Name:     actorName,
 		},
 	}
-	return c.control.GetActor(ctx, req)
+	var actor *ateapipb.Actor
+	err := retryOnCodes(ctx, func() error {
+		var err error
+		actor, err = c.control.GetActor(ctx, req)
+		return err
+	}, codes.Unavailable)
+	return actor, err
 }
 
 // DeleteActor deletes the specified actor from Substrate and blocks until the actor
@@ -491,7 +543,7 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 	err := retryOnCodes(ctx, func() error {
 		_, err := c.control.DeleteActor(ctx, req)
 		return err
-	}, codes.Aborted)
+	}, codes.Aborted, codes.Unavailable)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			return nil
@@ -540,7 +592,12 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 
 // ListActorTemplates returns all ActorTemplates in the given atespace.
 func (c *Client) ListActorTemplates(ctx context.Context, atespace string) ([]*ateapipb.ActorTemplate, error) {
-	resp, err := c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace})
+	var resp *ateapipb.ListActorTemplatesResponse
+	err := retryOnCodes(ctx, func() error {
+		var err error
+		resp, err = c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace})
+		return err
+	}, codes.Unavailable)
 	if err != nil {
 		return nil, fmt.Errorf("listing actor templates in %s: %w", atespace, err)
 	}
@@ -561,7 +618,7 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	err := retryOnCodes(ctx, func() error {
 		_, err := c.control.DeleteActorTemplate(ctx, req)
 		return err
-	}, codes.Aborted)
+	}, codes.Aborted, codes.Unavailable)
 	if err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("deleting actor template %s/%s: %w", atespace, templateName, err)
 	}

@@ -118,6 +118,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	// 1. Ensure the Atespace exists in Substrate
 	if err := r.client.EnsureAtespace(ctx, atespace); err != nil {
+		if substrate.IsTransientError(err) {
+			r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
+			task.Status.Phase = "Pending"
+			return task, fmt.Errorf("ensuring atespace: %w", err)
+		}
 		r.setCondition(task, "Ready", "False", "AtespaceCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("ensuring atespace: %w", err)
@@ -184,6 +189,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	_, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName)
 	if err != nil {
+		if substrate.IsTransientError(err) {
+			r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
+			task.Status.Phase = "Pending"
+			return task, fmt.Errorf("ensuring actor: %w", err)
+		}
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("ensuring actor: %w", err)
@@ -207,6 +217,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	slog.Info("resuming actor on Substrate worker", "actor", actorName)
 	_, workerIP, err := r.client.ResumeActor(ctx, atespace, actorName)
 	if err != nil {
+		if substrate.IsTransientError(err) {
+			r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
+			task.Status.Phase = "Pending"
+			return task, fmt.Errorf("resuming actor: %w", err)
+		}
 		r.setNotReady(task, "ActorResumeFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("resuming actor: %w", err)
