@@ -16,7 +16,9 @@ package controller_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"google.golang.org/protobuf/types/known/structpb"
 	"net"
 	"net/http"
 	"strings"
@@ -579,6 +581,16 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	defer httpLis.Close()
 
 	httpMux := http.NewServeMux()
+	var assignments []v1alpha1.Assignment
+	httpMux.HandleFunc("POST /v1alpha1/assignment", func(w http.ResponseWriter, r *http.Request) {
+		var a v1alpha1.Assignment
+		if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		assignments = append(assignments, a)
+		w.WriteHeader(http.StatusOK)
+	})
 	httpMux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -631,6 +643,10 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 		t.Fatalf("Resume with ready worker failed: %v", err)
 	}
 	assertCondition(t, task, "WorkspaceReady", "True", v1alpha1.ReasonSetupComplete)
+	// The task reached the runner at runtime, not through the template.
+	if len(assignments) != 1 || !strings.Contains(assignments[0].TaskYAML, "ready-task") {
+		t.Fatalf("runner got assignments %v, want one carrying ready-task", assignments)
+	}
 
 	// Case 3: Suspending the task -> the workspace was already initialized, so
 	// WorkspaceReady stays True.
@@ -650,13 +666,13 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 		t.Fatalf("readiness updates and suspend/resume created %d templates, want 1", got)
 	}
 
-	// A launch configuration change must still get a distinct template.
+	// The template carries no per-task data, so a command change reuses it.
 	task.Spec.Command = []string{"python3", "agent.py"}
 	if err := reconciler.Resume(ctx, task, nil); err != nil {
 		t.Fatalf("Resume with changed command failed: %v", err)
 	}
-	if got := len(mockSrv.actorTemplates); got != 2 {
-		t.Errorf("command change left %d templates, want 2", got)
+	if got := len(mockSrv.actorTemplates); got != 1 {
+		t.Errorf("command change left %d templates, want 1 shared template", got)
 	}
 }
 
@@ -1114,4 +1130,59 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	}
 	assertCondition(t, task4, "Ready", "False", v1alpha1.ReasonActorCreationFailed)
 	mockSrv.createActorErr = nil
+}
+
+// Tasks that run the same image with the same limits share one template, and
+// no prompt, config, or env reaches it.
+func TestTaskReconciler_SharesTemplateAcrossTasks(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+
+	newTask := func(name, prompt, secret string) *v1alpha1.Task {
+		config, err := structpb.NewStruct(map[string]any{"prompt": prompt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: name, Atespace: "default"},
+			Spec: &v1alpha1.TaskSpec{
+				Image:  "example.com/harness@sha256:abc",
+				Config: config,
+				Env:    []*v1alpha1.EnvVar{{Name: "TOKEN", Value: secret}},
+			},
+		}
+	}
+	for _, task := range []*v1alpha1.Task{
+		newTask("fix-tests", "run the tests and fix them", "one"),
+		newTask("write-docs", "improve the README", "two"),
+	} {
+		if err := reconciler.Suspend(ctx, task, nil); err != nil {
+			t.Fatalf("Suspend %s: %v", task.Metadata.Name, err)
+		}
+	}
+	if got := len(mockSrv.createdTemplates); got != 1 {
+		t.Fatalf("created %d templates for two tasks on one image, want 1", got)
+	}
+	tmpl := mockSrv.createdTemplates[0]
+	if env := tmpl.GetContainers()[0].GetEnv(); len(env) != 0 {
+		t.Errorf("shared template env = %v, want none", env)
+	}
+	if name := tmpl.GetMetadata().GetName(); strings.Contains(name, "fix-tests") || strings.Contains(name, "write-docs") {
+		t.Errorf("shared template name %q embeds a task name", name)
+	}
 }

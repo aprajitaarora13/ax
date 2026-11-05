@@ -16,6 +16,7 @@ package metadata
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,6 +47,41 @@ type Server struct {
 	task           *v1alpha1.Task
 	workspace      *v1alpha1.Workspace
 	workspaceReady bool
+	onAssignment   func(v1alpha1.Assignment) error
+	logDir         string
+}
+
+// enableGuest starts the guest services when task opts in via spec.debug.
+// Guest services expose process execution and file access inside the
+// container, so they are off otherwise.
+func (s *Server) enableGuest(task *v1alpha1.Task, wsPath string) {
+	if !task.GetSpec().GetDebug() {
+		slog.Info("guest services disabled; set spec.debug: true on the Task to enable ax ssh")
+		return
+	}
+	guestCfg := guest.DefaultConfig()
+	if wsPath != "" {
+		guestCfg.Workspace = wsPath
+	}
+	if s.logDir != "" {
+		guestCfg.LogDir = s.logDir
+	}
+	grpcServer, grpcCleanup, err := guest.NewServer(guestCfg)
+	if err != nil {
+		slog.Error("failed to initialize guest gRPC server", "error", err)
+		return
+	}
+	s.mu.Lock()
+	s.grpcServer, s.grpcCleanup = grpcServer, grpcCleanup
+	s.mu.Unlock()
+	slog.Info("guest services enabled (spec.debug is true)")
+}
+
+// Assign installs the task and workspace a runner received at runtime and
+// starts the guest services if the task asks for them.
+func (s *Server) Assign(task *v1alpha1.Task, ws *v1alpha1.Workspace, wsPath string) {
+	s.UpdateState(task, ws)
+	s.enableGuest(task, wsPath)
 }
 
 // ServerOptions configures optional settings for the metadata and guest server.
@@ -55,6 +91,10 @@ type ServerOptions struct {
 	// MetadataPort is the loopback port for the /metadata endpoints. Zero picks
 	// a free port; read the result from MetadataURL after Start.
 	MetadataPort int
+	// OnAssignment, when set, enables POST /v1alpha1/assignment on the probe
+	// port and is called with each assignment the control plane delivers. A
+	// nil error answers 200; an error answers 409 with the error's text.
+	OnAssignment func(v1alpha1.Assignment) error
 }
 
 // NewServer creates a new metadata and guest server serving the task and its
@@ -67,41 +107,32 @@ func NewServer(port int, task *v1alpha1.Task, ws *v1alpha1.Workspace, opts ...Se
 		opt = opts[0]
 	}
 	s := &Server{
-		task:      task,
-		workspace: ws,
+		task:         task,
+		workspace:    ws,
+		onAssignment: opt.OnAssignment,
 	}
 
-	// Guest services expose process execution and file access inside the container,
-	// so they are only served when the task opts in via spec.debug.
-	if task.GetSpec().GetDebug() {
-		guestCfg := guest.DefaultConfig()
-		if opt.WorkspacePath != "" {
-			guestCfg.Workspace = opt.WorkspacePath
-		}
-		if opt.LogDir != "" {
-			guestCfg.LogDir = opt.LogDir
-		}
-
-		grpcServer, grpcCleanup, err := guest.NewServer(guestCfg)
-		if err != nil {
-			slog.Error("failed to initialize guest gRPC server", "error", err)
-		} else {
-			s.grpcServer = grpcServer
-			s.grpcCleanup = grpcCleanup
-			slog.Info("guest services enabled (spec.debug is true)")
-		}
-	} else {
-		slog.Info("guest services disabled; set spec.debug: true on the Task to enable ax ssh")
+	s.logDir = opt.LogDir
+	// A runner awaiting its assignment has no task yet; guest services are
+	// decided once Assign delivers it.
+	if task != nil || s.onAssignment == nil {
+		s.enableGuest(task, opt.WorkspacePath)
 	}
 
 	// Probe endpoints, reachable from outside the container.
 	probeMux := http.NewServeMux()
 	probeMux.HandleFunc("/healthz", s.handleHealthz)
 	probeMux.HandleFunc("/readyz", s.handleReadyz)
+	if s.onAssignment != nil {
+		probeMux.HandleFunc("POST /v1alpha1/assignment", s.handleAssignment)
+	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.grpcServer != nil && r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
-			s.grpcServer.ServeHTTP(w, r)
+		s.mu.RLock()
+		grpcServer := s.grpcServer
+		s.mu.RUnlock()
+		if grpcServer != nil && r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcServer.ServeHTTP(w, r)
 			return
 		}
 		probeMux.ServeHTTP(w, r)
@@ -178,8 +209,11 @@ func (s *Server) Start() error {
 
 // Stop gracefully stops the probe, guest, and metadata servers.
 func (s *Server) Stop(ctx context.Context) error {
-	if s.grpcCleanup != nil {
-		s.grpcCleanup()
+	s.mu.RLock()
+	cleanup := s.grpcCleanup
+	s.mu.RUnlock()
+	if cleanup != nil {
+		cleanup()
 	}
 	// Shut both servers down concurrently so one draining its connections does
 	// not hold the other open or use up ctx's deadline.
@@ -218,11 +252,21 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
+// handleReadyz reports whether the workspace is prepared. A runner that is
+// still waiting for its assignment reports ready to a plain /readyz, so
+// Agent Substrate's wakeup probe lets the control plane deliver the
+// assignment; /readyz?check=workspace stays 503 until setup completes.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	ready := s.workspaceReady
+	awaiting := s.onAssignment != nil && s.task == nil
 	s.mu.RUnlock()
 
+	if awaiting && r.URL.Query().Get("check") != "workspace" {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("awaiting assignment\n"))
+		return
+	}
 	if !ready {
 		http.Error(w, "workspace initializing", http.StatusServiceUnavailable)
 		return
@@ -264,4 +308,27 @@ func (s *Server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 	if err := yaml.NewEncoder(w).Encode(ws); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// maxAssignmentSize bounds the assignment body: the encoded task and
+// workspace, with headroom over v1alpha1.MaxTaskYAMLSize.
+const maxAssignmentSize = 1 << 20
+
+// handleAssignment takes the task assignment from the control plane.
+func (s *Server) handleAssignment(w http.ResponseWriter, r *http.Request) {
+	var a v1alpha1.Assignment
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAssignmentSize)).Decode(&a); err != nil {
+		http.Error(w, "decoding assignment: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if a.TaskYAML == "" {
+		http.Error(w, "assignment has no task", http.StatusBadRequest)
+		return
+	}
+	if err := s.onAssignment(a); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
 }

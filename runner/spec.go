@@ -41,6 +41,12 @@ func LoadSpec(file, envVar string, out proto.Message) error {
 	default:
 		return nil
 	}
+	return DecodeSpec(raw, out)
+}
+
+// DecodeSpec decodes YAML into out, leniently like LoadSpec. Blank YAML
+// leaves out unchanged.
+func DecodeSpec(raw []byte, out proto.Message) error {
 	var node yaml.Node
 	if err := yaml.Unmarshal(raw, &node); err != nil {
 		return fmt.Errorf("parsing %T: %w", out, err)

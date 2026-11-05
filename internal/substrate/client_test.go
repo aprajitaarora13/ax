@@ -17,6 +17,7 @@ package substrate
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -510,5 +511,37 @@ func TestBuildActorTemplate_Resources(t *testing.T) {
 	tmpl = BuildActorTemplate("default", "task-tmpl-01234567", "ghcr.io/my-org/agent@sha256:abc", nil, nil, "", nil)
 	if !proto.Equal(tmpl.GetResources(), wantDefault) {
 		t.Fatalf("template without limits has resources %v, want %v", tmpl.GetResources(), wantDefault)
+	}
+}
+
+func TestBuildActorTemplate_MountsRunnerVolume(t *testing.T) {
+	tmpl := BuildActorTemplate("", "test-tmpl", "example.com/agent@sha256:abc", nil, nil, "", nil)
+	container := tmpl.GetContainers()[0]
+	if got := container.GetCommand(); len(got) != 1 || got[0] != v1alpha1.RunnerCommand {
+		t.Errorf("command = %v, want [%s]", got, v1alpha1.RunnerCommand)
+	}
+	if got := container.GetEnv(); len(got) != 0 {
+		t.Errorf("env = %v, want none", got)
+	}
+	var mounted bool
+	for _, m := range container.GetVolumeMounts() {
+		if m.GetName() == RunnerVolumeName && m.GetMountPath() == v1alpha1.RunnerMountPath {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Errorf("volume mounts = %v, want %s at %s", container.GetVolumeMounts(), RunnerVolumeName, v1alpha1.RunnerMountPath)
+	}
+	var ref string
+	for _, v := range tmpl.GetVolumes() {
+		if v.GetName() == RunnerVolumeName {
+			ref = v.GetImage().GetReference()
+		}
+	}
+	if ref != v1alpha1.RunnerVolumeImage {
+		t.Errorf("runner volume image = %q, want %q", ref, v1alpha1.RunnerVolumeImage)
+	}
+	if !strings.Contains(ref, "@sha256:") {
+		t.Errorf("runner volume image %q is not pinned by digest", ref)
 	}
 }

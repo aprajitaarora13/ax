@@ -23,6 +23,7 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -47,6 +48,19 @@ const (
 	// workspace binding sets a path.
 	DefaultWorkspacePath = v1alpha1.DefaultWorkspacePath
 
+	// DefaultStateDir is where the runner persists its assignment on the
+	// durable workspace volume, so a resumed container finds it again.
+	DefaultStateDir = "/workspace/.ax"
+	// DefaultRunDir is where the runner writes the task's goal and config for
+	// the harness. It is rewritten on every boot from the assignment.
+	DefaultRunDir = "/run/ax"
+	// DefaultHarnessPath is the launcher a pure agent image provides. When a
+	// task leaves spec.command empty, the runner runs it.
+	DefaultHarnessPath = "/usr/local/bin/ax-harness"
+
+	// assignmentFile is the assignment's file name under the state dir.
+	assignmentFile = "assignment.json"
+
 	// stopGracePeriod is how long a running task command gets to exit after
 	// SIGTERM before it is killed during shutdown.
 	stopGracePeriod = 10 * time.Second
@@ -68,6 +82,20 @@ type Config struct {
 	Workspace *v1alpha1.Workspace
 	// OnCommandExit, when set, is called once the task command has exited.
 	OnCommandExit func(CommandExit)
+
+	// AwaitAssignment makes a runner started without a Task wait for the
+	// control plane to deliver one at runtime (POST /v1alpha1/assignment), or
+	// pick up the one it persisted under StateDir before a suspend. This keeps
+	// per-task data out of the container environment and the ActorTemplate.
+	AwaitAssignment bool
+	// StateDir is where the assignment is persisted. Empty means DefaultStateDir.
+	StateDir string
+	// RunDir is where the goal and config files for the harness are written.
+	// Empty means DefaultRunDir.
+	RunDir string
+	// HarnessPath is the image's launcher, run when spec.command is empty.
+	// Empty means DefaultHarnessPath.
+	HarnessPath string
 }
 
 // CommandExit describes how the task command finished.
@@ -102,17 +130,37 @@ func Run(ctx context.Context, cfg Config) error {
 	if metadataPort <= 0 {
 		metadataPort = DefaultMetadataPort
 	}
-	ref := cfg.Task.GetSpec().GetWorkspace()
-	wsPath := cfg.Task.GetSpec().WorkspacePath()
-	slog.Info("initializing AX task runner", "port", port, "workspace", ref.GetName(), "wsPath", wsPath)
+	var assigned *assignmentWaiter
+	opts := metadata.ServerOptions{MetadataPort: metadataPort}
+	if cfg.Task == nil && cfg.AwaitAssignment {
+		assigned = newAssignmentWaiter(cmp.Or(cfg.StateDir, DefaultStateDir))
+		opts.OnAssignment = assigned.deliver
+	} else {
+		opts.WorkspacePath = cfg.Task.GetSpec().WorkspacePath()
+	}
 
-	metaServer := metadata.NewServer(port, cfg.Task, cfg.Workspace, metadata.ServerOptions{
-		WorkspacePath: wsPath,
-		MetadataPort:  metadataPort,
-	})
+	metaServer := metadata.NewServer(port, cfg.Task, cfg.Workspace, opts)
 	if err := metaServer.Start(); err != nil {
 		return fmt.Errorf("starting metadata server: %w", err)
 	}
+	if assigned != nil {
+		slog.Info("waiting for the task assignment")
+		task, ws, err := assigned.wait(ctx)
+		if err != nil {
+			_ = metaServer.Stop(context.Background())
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		cfg.Task, cfg.Workspace = task, ws
+		metaServer.Assign(task, ws, task.GetSpec().WorkspacePath())
+		slog.Info("received task assignment", "task", task.GetMetadata().GetName())
+	}
+
+	ref := cfg.Task.GetSpec().GetWorkspace()
+	wsPath := cfg.Task.GetSpec().WorkspacePath()
+	slog.Info("initializing AX task runner", "port", port, "workspace", ref.GetName(), "wsPath", wsPath)
 	metadataURL := metaServer.MetadataURL()
 	_ = os.Setenv("AX_METADATA_URL", metadataURL)
 	for _, e := range cfg.Task.GetSpec().GetEnv() {
@@ -130,7 +178,17 @@ func Run(ctx context.Context, cfg Config) error {
 		slog.Info("workspace maiden run setup marked ready", "path", wsPath)
 	}
 
+	harnessEnv, err := writeHarnessFiles(cmp.Or(cfg.RunDir, DefaultRunDir), cfg.Task)
+	if err != nil {
+		slog.Error("writing harness goal and config files failed", "error", err)
+	}
 	cmdArgs := cfg.Task.GetSpec().GetCommand()
+	if len(cmdArgs) == 0 {
+		harness := cmp.Or(cfg.HarnessPath, DefaultHarnessPath)
+		if _, err := os.Stat(harness); err == nil {
+			cmdArgs = []string{harness}
+		}
+	}
 	if len(cmdArgs) == 0 {
 		slog.Info("no task command specified; serving metadata until stopped")
 		<-ctx.Done()
@@ -142,7 +200,7 @@ func Run(ctx context.Context, cfg Config) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = commandEnv(cfg.Task, metadataURL)
+	cmd.Env = append(commandEnv(cfg.Task, metadataURL), harnessEnv...)
 	// A dedicated process group lets shutdown signal the command together with
 	// anything it spawned.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

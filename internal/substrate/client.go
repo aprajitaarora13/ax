@@ -216,7 +216,11 @@ func (c *Client) GetActorTemplate(ctx context.Context, atespace, templateName st
 }
 
 const (
-	DefaultGuestCommand = "/usr/local/bin/ax-task-runner"
+	// DefaultGuestCommand is the container command of every task: the runner
+	// mounted from the read-only runner volume.
+	DefaultGuestCommand = v1alpha1.RunnerCommand
+	// RunnerVolumeName names the read-only volume that carries the runner.
+	RunnerVolumeName = "ax-runner"
 
 	// defaultRetryAttempts is the maximum number of calls retryOnCodes makes. With
 	// exponential backoff from defaultRetryInterval capped at maxRetryInterval
@@ -387,11 +391,19 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			VolumeMounts: []*ateapipb.VolumeMount{{
 				Name:      "workspace",
 				MountPath: "/workspace",
+			}, {
+				Name:      RunnerVolumeName,
+				MountPath: v1alpha1.RunnerMountPath,
 			}},
 		}},
 		Volumes: []*ateapipb.Volume{{
 			Name:       "workspace",
 			DurableDir: &ateapipb.DurableDirVolumeSource{},
+		}, {
+			// The runner ships as its own read-only OCI image so the task image
+			// stays a pure agent image.
+			Name:  RunnerVolumeName,
+			Image: &ateapipb.ImageVolumeSource{Reference: v1alpha1.RunnerVolumeImage},
 		}},
 		SnapshotConfig: snapCfg,
 		Resources: &ateapipb.ResourceRequirements{

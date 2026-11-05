@@ -388,14 +388,10 @@ func TestCreateTask_RequiresBoundWorkspace(t *testing.T) {
 			if !ok {
 				t.Fatalf("actor template %v not found", ref)
 			}
-			var gotWorkspace bool
-			for _, env := range tmpl.GetContainers()[0].GetEnv() {
-				if env.GetName() == "AX_WORKSPACE_YAML" {
-					gotWorkspace = true
-				}
-			}
-			if gotWorkspace != tc.wantWorkspace {
-				t.Errorf("template has AX_WORKSPACE_YAML = %v, want %v", gotWorkspace, tc.wantWorkspace)
+			// The task and workspace reach the runner at runtime; the
+			// template must not carry them.
+			if env := tmpl.GetContainers()[0].GetEnv(); len(env) != 0 {
+				t.Errorf("template env = %v, want none", env)
 			}
 		})
 	}
@@ -454,7 +450,8 @@ func TestServer_DirectReconcilerLifecycle(t *testing.T) {
 		t.Errorf("expected phase Suspended, got %s", task.GetStatus().GetPhase())
 	}
 
-	// 4. DeleteTask deletes the actor and its ActorTemplate
+	// 4. DeleteTask deletes the actor; the shared image ActorTemplate stays
+	// for other tasks that run the same image.
 	_, err = srv.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Name: "task-rec"})
 	if err != nil {
 		t.Fatalf("DeleteTask: %v", err)
@@ -462,8 +459,8 @@ func TestServer_DirectReconcilerLifecycle(t *testing.T) {
 	if _, ok := sub.Actor("default", "task-rec"); ok {
 		t.Error("expected the actor to be deleted")
 	}
-	if _, ok := sub.Template(tmpl.GetAtespace(), tmpl.GetName()); ok {
-		t.Errorf("expected ActorTemplate %s/%s to be deleted", tmpl.GetAtespace(), tmpl.GetName())
+	if _, ok := sub.Template(tmpl.GetAtespace(), tmpl.GetName()); !ok {
+		t.Errorf("expected shared ActorTemplate %s/%s to be kept", tmpl.GetAtespace(), tmpl.GetName())
 	}
 
 	// 5. Verify task is gone

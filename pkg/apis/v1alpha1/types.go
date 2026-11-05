@@ -38,6 +38,18 @@ const (
 	DefaultTaskImage       = "gcr.io/ax-substrate/ate-images/ax-task-runner"
 	DefaultSystemNamespace = "ax-system"
 
+	// RunnerVolumeImage is the OCI image, pinned by digest, that holds only the
+	// static ax-task-runner binary (built from Dockerfile.runner-volume). Agent
+	// Substrate mounts it read-only into every task container at
+	// RunnerMountPath, so task images stay pure agent images and a runner update
+	// never forces an agent image rebuild. Bump the digest to roll out a runner.
+	RunnerVolumeImage = "localhost:5001/ax-runner@sha256:b2d6de3d016d1129cc4a3c92729f0868acfba8ac6996e9fa8ae3b821be2ddbef"
+	// RunnerMountPath is where the runner volume is mounted in the container.
+	RunnerMountPath = "/opt/ax"
+	// RunnerCommand is the container command of every task: the runner from
+	// the read-only runner volume.
+	RunnerCommand = RunnerMountPath + "/ax-task-runner"
+
 	// PhasePending marks a task whose actor has not been provisioned yet, for
 	// example because Substrate was unavailable. Retrying the operation can
 	// still succeed.

@@ -15,10 +15,12 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,7 +28,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -176,32 +177,7 @@ func (r *TaskReconciler) ensureSubstrateResources(ctx context.Context, task *v1a
 		templateName = parts[1]
 	}
 
-	// Prepare container environment variables (task env + specs)
-	extraEnv := make(map[string]string)
-	if task.Spec != nil {
-		for _, e := range task.Spec.Env {
-			if e.Name != "" {
-				extraEnv[e.Name] = e.Value
-			}
-		}
-	}
-
-	// Only launch configuration belongs in the template; status changes
-	// must not create new golden snapshots.
-	launchTask := proto.Clone(task).(*v1alpha1.Task)
-	launchTask.Status = nil
-	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
-		extraEnv["AX_TASK_YAML"] = string(taskYAML)
-	}
-
-	// Inject the bound Workspace spec, if any.
-	if ws != nil {
-		if wsYAML, err := yaml.Marshal(ws); err == nil {
-			extraEnv["AX_WORKSPACE_YAML"] = string(wsYAML)
-		}
-	}
-
-	// Resource limits are enforced by the per-task template, so they are checked
+	// Resource limits are enforced by the template, so they are checked
 	// here as well as at apply time: a task must never run without limits it asked for.
 	if err := v1alpha1.ValidateResources(task.Spec.Resources); err != nil {
 		r.setNotReady(task, v1alpha1.ReasonInvalidResources, err.Error(), now)
@@ -209,14 +185,14 @@ func (r *TaskReconciler) ensureSubstrateResources(ctx context.Context, task *v1a
 	}
 	resources := substrate.ResourceLimits(task.Spec.Resources)
 
-	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
-	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
-		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
-		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
-
-		// spec.resources rides along in AX_TASK_YAML, so a limits change is already
-		// part of the template digest and re-provisions the template.
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, resources, extraEnv)
+	// The template carries no per-task data: no prompt, config, or env. Tasks
+	// that run the same image with the same limits share one template (and so
+	// its warm snapshots). The task itself is handed to the runner at runtime
+	// by Resume (see deliverAssignment).
+	if task.Spec != nil && task.Spec.Image != "" {
+		sharedTemplateName := imageTemplateName(task.Spec.Image, task.Spec.Resources)
+		slog.Info("ensuring shared ActorTemplate for image", "image", task.Spec.Image, "template", sharedTemplateName)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, sharedTemplateName, task.Spec.Image, resources)
 		if err != nil {
 			if substrate.IsTransientError(err) {
 				r.setNotReady(task, v1alpha1.ReasonSubstrateUnavailable, err.Error(), now)
@@ -232,7 +208,7 @@ func (r *TaskReconciler) ensureSubstrateResources(ctx context.Context, task *v1a
 		if tmpl != nil && tmpl.Metadata != nil {
 			templateAtespace = tmpl.Metadata.Atespace
 			templateName = tmpl.Metadata.Name
-			slog.Info("using custom ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)
+			slog.Info("using shared ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)
 		}
 	}
 
@@ -293,12 +269,21 @@ func (r *TaskReconciler) Resume(ctx context.Context, task *v1alpha1.Task, ws *v1
 		host = h
 		port = p
 	}
-	readyURL := fmt.Sprintf("http://%s/readyz?check=workspace", net.JoinHostPort(host, port))
+	readyPath := "/readyz?check=workspace"
+	// The task is handed to the runner at runtime instead of through the
+	// template, so every resume delivers it once the runner answers. The runner
+	// treats a repeat delivery of the same task as a no-op.
+	assignment, err := encodeAssignment(task, ws)
+	if err != nil {
+		r.setNotReady(task, v1alpha1.ReasonActorResumeFailed, err.Error(), now)
+		return fmt.Errorf("encoding assignment: %w", err)
+	}
+	delivered := false
 	// Workspace setup happens once per task. After it has completed, WorkspaceReady stays
 	// True across suspend/resume cycles, so only poll while it is still initializing.
 	workspaceReady := conditionTrue(task, v1alpha1.ConditionWorkspaceReady)
-	if workerIP != "" && !workspaceReady {
-		// Poll briefly for workspace setup completion
+	if workerIP != "" {
+		// Poll briefly for assignment delivery and workspace setup completion
 		pollCtx, cancel := context.WithTimeout(ctx, r.WorkspaceReadyTimeout)
 		defer cancel()
 
@@ -306,56 +291,37 @@ func (r *TaskReconciler) Resume(ctx context.Context, task *v1alpha1.Task, ws *v1
 		defer ticker.Stop()
 
 		checkReady := func() bool {
-			// 1. Direct readyz check
-			req, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, readyURL, nil)
-			if resp, err := r.httpClient.Do(req); err == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					return true
+			if !delivered {
+				code := r.actorRequest(pollCtx, http.MethodPost, host, port, runnerAssignmentPath, assignment, atespace, actorName)
+				delivered = code == http.StatusOK
+				if !delivered {
+					return false
 				}
+				slog.Info("delivered task assignment to runner", "actor", actorName)
 			}
-
-			// 2. Router-based readyz check (in-cluster via atenet-router)
-			if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
-				routerURL := routerAddr
-				if !strings.HasPrefix(routerURL, "http://") && !strings.HasPrefix(routerURL, "https://") {
-					if strings.HasSuffix(routerURL, ":443") {
-						routerURL = "https://" + routerURL
-					} else {
-						routerURL = "http://" + routerURL
-					}
-				}
-				routerURL = strings.TrimRight(routerURL, "/") + "/readyz?check=workspace"
-				rReq, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, routerURL, nil)
-				if rReq != nil {
-					rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
-					if resp, err := r.httpClient.Do(rReq); err == nil {
-						_ = resp.Body.Close()
-						if resp.StatusCode == http.StatusOK {
-							return true
-						}
-					}
-				}
-			}
-			return false
+			return workspaceReady || r.actorRequest(pollCtx, http.MethodGet, host, port, readyPath, nil, atespace, actorName) == http.StatusOK
 		}
 
 		// Initial check
-		workspaceReady = checkReady()
+		ready := checkReady()
 
-		for !workspaceReady {
+		for !ready {
 			select {
 			case <-pollCtx.Done():
 				goto DonePolling
 			case <-ticker.C:
-				if checkReady() {
-					workspaceReady = true
-					goto DonePolling
-				}
+				ready = checkReady()
 			}
 		}
+		workspaceReady = true
 	}
 DonePolling:
+	if !delivered && workerIP != "" {
+		// A cold start (image and runner volume pulls) can outlast the resume
+		// call; keep delivering in the background until the runner takes it.
+		slog.Info("task assignment not delivered yet; retrying in the background", "actor", actorName)
+		go r.deliverInBackground(host, port, assignment, atespace, actorName)
+	}
 
 	// The server derives Ready from the actor's state and WorkspaceReady.
 	if workspaceReady {
@@ -432,24 +398,29 @@ func setCondition(task *v1alpha1.Task, condType, status, reason, message string,
 	})
 }
 
-// taskTemplateName derives the per-task ActorTemplate name from the task name and a
-// digest of the image and container environment, so a spec change yields a new template.
-func taskTemplateName(taskName, image string, env map[string]string) string {
+// imageTemplateName derives the shared ActorTemplate name from the image, the
+// runner volume, and the resource limits only. Per-task data (prompt, config,
+// env) never reaches the template, so every task that runs the same image with
+// the same limits shares one template and its warm snapshots. Bumping
+// v1alpha1.RunnerVolumeImage rolls every image onto a new template.
+func imageTemplateName(image string, resources *v1alpha1.ResourcesSpec) string {
 	h := sha256.New()
 	h.Write([]byte(image))
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
+	h.Write([]byte{0})
+	h.Write([]byte(v1alpha1.RunnerVolumeImage))
+	h.Write([]byte{0})
+	if b, err := proto.Marshal(resources); err == nil {
+		h.Write(b)
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		h.Write([]byte(k + "=" + env[k] + ";"))
-	}
-	return fmt.Sprintf("%s-tmpl-%x", taskName, h.Sum(nil)[:templateDigestBytes])
+	return fmt.Sprintf("%s%x", sharedTemplatePrefix, h.Sum(nil)[:templateDigestBytes])
 }
 
-// taskTemplatePattern matches every ActorTemplate name taskTemplateName can produce
-// for the given task, across all spec revisions.
+// sharedTemplatePrefix starts every name imageTemplateName produces.
+const sharedTemplatePrefix = "ax-img-tmpl-"
+
+// taskTemplatePattern matches every per-task ActorTemplate name earlier
+// versions of AX produced for the given task, so they are still cleaned up.
+// Shared image templates are never deleted with a task.
 func taskTemplatePattern(taskName string) *regexp.Regexp {
 	return regexp.MustCompile(fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskName), 2*templateDigestBytes))
 }
@@ -506,4 +477,96 @@ func (r *TaskReconciler) deleteTaskTemplates(ctx context.Context, atespace, task
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// runnerAssignmentPath is the runner endpoint, on its probe port, that takes
+// the task assignment. It is served by internal/metadata.
+const runnerAssignmentPath = "/v1alpha1/assignment"
+
+// encodeAssignment encodes the launch configuration of task (without status)
+// and its bound workspace, which may be nil, as the runner's assignment.
+func encodeAssignment(task *v1alpha1.Task, ws *v1alpha1.Workspace) ([]byte, error) {
+	launchTask := proto.Clone(task).(*v1alpha1.Task)
+	launchTask.Status = nil
+	var a v1alpha1.Assignment
+	taskYAML, err := yaml.Marshal(launchTask)
+	if err != nil {
+		return nil, fmt.Errorf("encoding task: %w", err)
+	}
+	a.TaskYAML = string(taskYAML)
+	if ws != nil {
+		wsYAML, err := yaml.Marshal(ws)
+		if err != nil {
+			return nil, fmt.Errorf("encoding workspace: %w", err)
+		}
+		a.WorkspaceYAML = string(wsYAML)
+	}
+	return json.Marshal(a)
+}
+
+// actorRequest sends a request to the runner in the task's actor, first
+// directly at host:port and then through the atenet-router when
+// ATENET_ROUTER_ADDR is set. It returns the first 200 status, or the last
+// status seen (0 when no request got a response).
+func (r *TaskReconciler) actorRequest(ctx context.Context, method, host, port, path string, body []byte, atespace, actorName string) int {
+	urls := []string{"http://" + net.JoinHostPort(host, port) + path}
+	if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
+		routerURL := routerAddr
+		if !strings.HasPrefix(routerURL, "http://") && !strings.HasPrefix(routerURL, "https://") {
+			if strings.HasSuffix(routerURL, ":443") {
+				routerURL = "https://" + routerURL
+			} else {
+				routerURL = "http://" + routerURL
+			}
+		}
+		urls = append(urls, strings.TrimRight(routerURL, "/")+path)
+	}
+	last := 0
+	for i, u := range urls {
+		req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if i > 0 {
+			req.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
+		}
+		resp, err := r.httpClient.Do(req)
+		if err != nil {
+			continue
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return http.StatusOK
+		}
+		last = resp.StatusCode
+	}
+	return last
+}
+
+// assignmentRetryWindow bounds background delivery of a task assignment.
+const assignmentRetryWindow = 15 * time.Minute
+
+// deliverInBackground retries the assignment until the runner accepts it or
+// assignmentRetryWindow passes. The runner treats repeats as no-ops, so a
+// concurrent delivery from a later resume is harmless.
+func (r *TaskReconciler) deliverInBackground(host, port string, assignment []byte, atespace, actorName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), assignmentRetryWindow)
+	defer cancel()
+	ticker := time.NewTicker(2 * workspaceReadyPollInterval)
+	defer ticker.Stop()
+	for {
+		if r.actorRequest(ctx, http.MethodPost, host, port, runnerAssignmentPath, assignment, atespace, actorName) == http.StatusOK {
+			slog.Info("delivered task assignment to runner", "actor", actorName)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			slog.Warn("gave up delivering task assignment to runner; it is retried on the next resume", "actor", actorName)
+			return
+		case <-ticker.C:
+		}
+	}
 }

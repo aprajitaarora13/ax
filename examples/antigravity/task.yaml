@@ -1,0 +1,67 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A Task that runs the pure prebuilt Antigravity image (harnesses/antigravity)
+# headlessly against a cloned repository.
+#
+# The image has no AX runner in it: AX mounts the runner read-only at /opt/ax,
+# hands it this Task at runtime, and the runner writes spec.config.prompt to
+# $AX_GOAL_FILE and spec.config to $AX_CONFIG_FILE before starting the image's
+# ax-harness launcher. Nothing below reaches the ActorTemplate, so every task
+# on this image shares one template.
+#
+#   make push-harness-image HARNESS=antigravity   # pin the digest below
+#   AX_GOOGLE_CREDENTIALS_JSON="$(cat ~/.config/gcloud/application_default_credentials.json)" \
+#   GOOGLE_CLOUD_PROJECT=my-project envsubst < examples/antigravity/task.yaml | ax apply -f -
+#   ax resume antigravity-review
+#   ax ssh antigravity-review -- cat /workspace/ax-output.md
+apiVersion: ax.io/v1alpha1
+kind: Workspace
+metadata:
+  name: itsdangerous
+  atespace: default
+spec:
+  git:
+    - name: origin
+      repo: "https://github.com/pallets/itsdangerous.git"
+      branch: "main"
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: antigravity-review
+  atespace: default
+spec:
+  image: "localhost:5001/ax-harness-antigravity@sha256:8662e5c5b90beff39116ad7ba8f90e64e2cf4393a5765241e2539db15d630ae5"
+  # spec.command is empty, so the runner starts the image's ax-harness.
+  config:
+    prompt: |
+      Read this repository. In at most 15 lines of markdown, explain what the
+      library does, how its tests are run, and list three small, concrete
+      improvements. Do not modify any files.
+    printTimeout: 15m
+  env:
+    # Delivered to the runner at runtime, never stored in the ActorTemplate.
+    # TODO: replace with Substrate egress credential injection.
+    - name: GOOGLE_CLOUD_PROJECT
+      value: "${GOOGLE_CLOUD_PROJECT}"
+    - name: AX_GOOGLE_CREDENTIALS_JSON
+      value: '${AX_GOOGLE_CREDENTIALS_JSON}'
+  resources:
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  workspace:
+    name: itsdangerous
+  debug: true

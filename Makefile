@@ -38,7 +38,7 @@ CLAUDE_CODE_BASE_IMAGE ?=
 # Prefer podman, fall back to docker.
 CONTAINER_CLI ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 
-.PHONY: build install images check-image-repo build-claude-code-image push-claude-code-image deploy deploy-server deploy-postgres apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean
+.PHONY: push-runner-volume push-harness-image build install images check-image-repo build-claude-code-image push-claude-code-image deploy deploy-server deploy-postgres apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean
 
 ## --------------------------------------
 ## Build Targets
@@ -113,6 +113,27 @@ push-claude-code-image: build-claude-code-image
 	@mkdir -p bin
 	$(call push_image,$(CLAUDE_CODE_REPO):latest,claude-code)
 	@echo "==> Pushed digest: $(CLAUDE_CODE_REPO)@$$(cat bin/claude-code.digest)"
+
+# The runner volume: a FROM-scratch image holding only ax-task-runner, mounted
+# read-only into every task at /opt/ax. Pin the printed digest in
+# v1alpha1.RunnerVolumeImage.
+RUNNER_VOLUME_REPO ?= localhost:5001/ax-runner
+push-runner-volume:
+	@mkdir -p bin/linux_$(IMAGE_ARCH)
+	GOOS=linux GOARCH=$(IMAGE_ARCH) CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/linux_$(IMAGE_ARCH)/ax-task-runner ./cmd/ax-task-runner
+	$(CONTAINER_CLI) build --platform linux/$(IMAGE_ARCH) --build-arg TARGETARCH=$(IMAGE_ARCH) -t $(RUNNER_VOLUME_REPO):latest -f Dockerfile.runner-volume .
+	$(call push_image,$(RUNNER_VOLUME_REPO):latest,ax-runner)
+	@echo "==> Runner volume: $(RUNNER_VOLUME_REPO)@$$(cat bin/ax-runner.digest)"
+
+# Pure prebuilt agent images (no runner inside), one directory per harness
+# under harnesses/. CI publishes them with .github/workflows/harness-images.yaml.
+HARNESS ?= antigravity
+HARNESS_REPO ?= localhost:5001/ax-harness-$(HARNESS)
+push-harness-image:
+	@mkdir -p bin
+	$(CONTAINER_CLI) build --platform linux/$(IMAGE_ARCH) -t $(HARNESS_REPO):latest harnesses/$(HARNESS)
+	$(call push_image,$(HARNESS_REPO):latest,harness-$(HARNESS))
+	@echo "==> Harness image: $(HARNESS_REPO)@$$(cat bin/harness-$(HARNESS).digest)"
 
 ## --------------------------------------
 ## Deployment Targets

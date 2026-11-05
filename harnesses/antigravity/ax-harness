@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ax-harness: the Antigravity launcher for the AX in-container contract.
+#
+# Inputs, all provided by the AX runner:
+#   AX_GOAL_FILE    the task's goal (spec.config.prompt)
+#   AX_CONFIG_FILE  spec.config as JSON. Optional keys read here:
+#                     model          agy --model
+#                     effort         agy --effort
+#                     outputFile     where to write the final answer
+#                                    (default: ax-output.md in the workspace)
+#                     printTimeout   agy --print-timeout (default: 0, no limit)
+#   cwd             the task's workspace
+#
+# Credentials: with GEMINI_API_KEY set, agy uses it. Otherwise it signs in with
+# Application Default Credentials against GOOGLE_CLOUD_PROJECT (Vertex AI). A
+# credentials JSON can be handed over in AX_GOOGLE_CREDENTIALS_JSON; it is
+# written outside the workspace so it is never snapshotted with the agent's
+# files.
+set -euo pipefail
+
+goal_file="${AX_GOAL_FILE:?AX_GOAL_FILE is not set; ax-harness must be started by the AX runner}"
+config_file="${AX_CONFIG_FILE:-/dev/null}"
+
+cfg() { jq -r --arg k "$1" '.[$k] // empty' "${config_file}" 2>/dev/null || true; }
+
+if [[ ! -s "${goal_file}" ]]; then
+  echo "ax-harness: empty goal in ${goal_file}; set spec.config.prompt" >&2
+  exit 2
+fi
+
+if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+  export AGY_ADC_AUTH=true
+  if [[ -n "${AX_GOOGLE_CREDENTIALS_JSON:-}" ]]; then
+    creds_dir="$(dirname "${goal_file}")"
+    umask 077
+    printf '%s' "${AX_GOOGLE_CREDENTIALS_JSON}" > "${creds_dir}/adc.json"
+    export GOOGLE_APPLICATION_CREDENTIALS="${creds_dir}/adc.json"
+    unset AX_GOOGLE_CREDENTIALS_JSON
+  fi
+fi
+
+args=(--print "$(cat "${goal_file}")" --dangerously-skip-permissions --output-format json)
+args+=(--print-timeout "$(cfg printTimeout || true)")
+[[ "${args[-1]}" == "" ]] && args[-1]="0s"
+model="$(cfg model)"; [[ -n "${model}" ]] && args+=(--model "${model}")
+effort="$(cfg effort)"; [[ -n "${effort}" ]] && args+=(--effort "${effort}")
+output_file="$(cfg outputFile)"; output_file="${output_file:-ax-output.md}"
+
+echo "ax-harness: running agy in $(pwd) (output: ${output_file})"
+set +e
+agy "${args[@]}" > /tmp/agy-result.json
+status=$?
+set -e
+
+jq -r '.response // empty' /tmp/agy-result.json > "${output_file}" || true
+jq -c '{status, num_turns, duration_seconds, usage}' /tmp/agy-result.json 2>/dev/null || cat /tmp/agy-result.json
+echo "ax-harness: agy exited with ${status}; answer written to ${output_file}"
+exit "${status}"

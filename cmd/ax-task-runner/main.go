@@ -16,9 +16,11 @@
 // loads the Task and Workspace specs and hands them to the runner package,
 // which does everything else.
 //
-// AX delivers the Task as YAML in AX_TASK_YAML and the bound Workspace, if
-// any, as YAML in AX_WORKSPACE_YAML. For local runs the specs can be read from
-// files instead with --task-file and --workspace-file.
+// AX delivers the Task and its bound Workspace at runtime, in a POST to
+// /v1alpha1/assignment on the probe port, and the runner persists them on the
+// durable workspace volume for later resumes. AX_TASK_YAML and
+// AX_WORKSPACE_YAML, or --task-file and --workspace-file for local runs, still
+// take precedence when set.
 package main
 
 import (
@@ -53,6 +55,10 @@ func main() {
 		fatal(err)
 	} else if task.GetMetadata() != nil {
 		cfg.Task = &task
+	} else {
+		// No task in the environment or a file: the control plane delivers
+		// it at runtime, which keeps the ActorTemplate free of per-task data.
+		cfg.AwaitAssignment = true
 	}
 
 	var ws v1alpha1.Workspace
