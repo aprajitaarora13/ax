@@ -42,7 +42,12 @@ type Server struct {
 	metadataAddr   string // bound address of the metadata listener, set by Start
 	grpcServer     *grpc.Server
 	grpcCleanup    func()
-	mu             sync.RWMutex
+	// grpcLoopbackAddr and grpcLoopbackConn serve guest gRPC calls that arrive
+	// framed over HTTP/1.1 (see http1_grpc.go) by replaying them over h2c to
+	// grpcServer on a loopback listener.
+	grpcLoopbackAddr string
+	grpcLoopbackConn *grpc.ClientConn
+	mu               sync.RWMutex
 	task           *v1alpha1.Task
 	workspace      *v1alpha1.Workspace
 	workspaceReady bool
@@ -100,8 +105,24 @@ func NewServer(port int, task *v1alpha1.Task, ws *v1alpha1.Workspace, opts ...Se
 	probeMux.HandleFunc("/readyz", s.handleReadyz)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.grpcServer != nil && r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+		isGRPC := strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
+		if s.grpcServer != nil && r.ProtoMajor == 2 && isGRPC {
 			s.grpcServer.ServeHTTP(w, r)
+			return
+		}
+		if s.grpcServer != nil && strings.HasPrefix(r.Header.Get("Content-Type"), HTTP1GRPCContentType) {
+			s.handleHTTP1GRPC(w, r)
+			return
+		}
+		if isGRPC {
+			// Say why the call can't be served instead of a bare 404, so a
+			// proxy that downgrades to HTTP/1.1 is told apart from a task
+			// without spec.debug.
+			reason := fmt.Sprintf("guest gRPC requires HTTP/2, got %s", r.Proto)
+			if s.grpcServer == nil {
+				reason = "guest services disabled; set spec.debug: true on the Task"
+			}
+			http.Error(w, reason, http.StatusNotFound)
 			return
 		}
 		probeMux.ServeHTTP(w, r)
@@ -157,6 +178,21 @@ func (s *Server) Start() error {
 		return fmt.Errorf("metadata server listening on %s: %w", s.metadataServer.Addr, err)
 	}
 
+	if s.grpcServer != nil {
+		grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			_ = lis.Close()
+			_ = metadataLis.Close()
+			return fmt.Errorf("guest gRPC loopback listener: %w", err)
+		}
+		s.grpcLoopbackAddr = grpcLis.Addr().String()
+		go func() {
+			if err := s.grpcServer.Serve(grpcLis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+				slog.Error("guest gRPC loopback server error", "error", err)
+			}
+		}()
+	}
+
 	s.probeAddr = lis.Addr().String()
 	s.metadataAddr = metadataLis.Addr().String()
 	slog.Info("probe and guest server started", "addr", s.probeAddr)
@@ -178,6 +214,12 @@ func (s *Server) Start() error {
 
 // Stop gracefully stops the probe, guest, and metadata servers.
 func (s *Server) Stop(ctx context.Context) error {
+	s.mu.Lock()
+	if s.grpcLoopbackConn != nil {
+		_ = s.grpcLoopbackConn.Close()
+		s.grpcLoopbackConn = nil
+	}
+	s.mu.Unlock()
 	if s.grpcCleanup != nil {
 		s.grpcCleanup()
 	}

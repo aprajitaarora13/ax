@@ -104,6 +104,12 @@ func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) 
 
 	dialOpts := append([]grpc.DialOption{}, extraDialOpts...)
 
+	managed := IsManagedTarget(opts.Target)
+	authority := opts.Authority
+	if managed && (authority == "" || authority == "api.ate-system.svc") {
+		authority = HostOnly(opts.Target)
+	}
+
 	if opts.Plaintext {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
@@ -111,8 +117,8 @@ func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) 
 		if opts.InsecureTLS {
 			tlsConfig.InsecureSkipVerify = true
 		}
-		if opts.Authority != "" {
-			tlsConfig.ServerName = opts.Authority
+		if authority != "" {
+			tlsConfig.ServerName = authority
 		} else if strings.Contains(opts.Target, "api.ate-system.svc") {
 			tlsConfig.ServerName = "api.ate-system.svc"
 		}
@@ -127,12 +133,15 @@ func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) 
 				return nil, fmt.Errorf("failed to parse CA certificate from %q", opts.CAFile)
 			}
 			tlsConfig.RootCAs = pool
+		} else if pool, err := LoadManagedCAPool(); err != nil {
+			return nil, err
+		} else if pool != nil {
+			tlsConfig.RootCAs = pool
 		}
 
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	}
 
-	authority := opts.Authority
 	if authority == "" && strings.Contains(opts.Target, "api.ate-system.svc") {
 		authority = "api.ate-system.svc"
 	}
@@ -142,6 +151,10 @@ func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) 
 
 	if opts.TokenFile != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(tokenAuth{tokenFile: opts.TokenFile}))
+	} else if managed && !opts.Plaintext {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(metadataPerRPCAuth{
+			source: NewMetadataIDTokenSource(authority),
+		}))
 	}
 
 	conn, err := grpc.NewClient(opts.Target, dialOpts...)
@@ -447,6 +460,12 @@ func (c *Client) EnsureActorTemplate(ctx context.Context, tmpl *ateapipb.ActorTe
 	created, err := callWithRetry(ctx, func() (*ateapipb.ActorTemplate, error) {
 		return c.control.CreateActorTemplate(ctx, req)
 	})
+	if unsupportedSystemInfoVolume(err) {
+		req = &ateapipb.CreateActorTemplateRequest{ActorTemplate: adaptTemplateForManagedSandbox(tmpl)}
+		created, err = callWithRetry(ctx, func() (*ateapipb.ActorTemplate, error) {
+			return c.control.CreateActorTemplate(ctx, req)
+		})
+	}
 	if err != nil && status.Code(err) != codes.AlreadyExists {
 		return nil, fmt.Errorf("creating actor template %s/%s: %w", atespace, name, err)
 	}

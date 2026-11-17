@@ -17,9 +17,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -28,10 +30,12 @@ import (
 	"time"
 
 	"github.com/google/ax/internal/guest"
+	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/internal/tunnel"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -279,10 +283,44 @@ Flags:
   --trace                     Trace this command and print its trace ID to stderr`)
 }
 
+type staticBearerAuth struct {
+	token      string
+	requireTLS bool
+}
+
+func (s staticBearerAuth) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + s.token}, nil
+}
+
+func (s staticBearerAuth) RequireTransportSecurity() bool { return s.requireTLS }
+
+func resolveEndpointDial(serverURL string) (target string, tlsCfg *tls.Config, extra []grpc.DialOption) {
+	useTLS := strings.HasPrefix(serverURL, "https://")
+	target = strings.TrimRight(strings.TrimPrefix(strings.TrimPrefix(serverURL, "http://"), "https://"), "/")
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		if useTLS {
+			target = net.JoinHostPort(target, "443")
+		} else {
+			target = net.JoinHostPort(target, "80")
+		}
+	}
+	if useTLS {
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: substrate.HostOnly(target)}
+	}
+	if tok := strings.TrimSpace(os.Getenv("AX_AUTH_TOKEN")); tok != "" {
+		extra = append(extra, grpc.WithPerRPCCredentials(staticBearerAuth{token: tok, requireTLS: useTLS}))
+	}
+	return target, tlsCfg, extra
+}
+
 func getAXClient(serverURL string) (v1alpha1.AXClient, *grpc.ClientConn, error) {
-	target := strings.TrimPrefix(serverURL, "http://")
-	target = strings.TrimPrefix(target, "https://")
-	opts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, activeTrace.dialOptions()...)
+	target, tlsCfg, authOpts := resolveEndpointDial(serverURL)
+	creds := insecure.NewCredentials()
+	if tlsCfg != nil {
+		creds = credentials.NewTLS(tlsCfg)
+	}
+	opts := append([]grpc.DialOption{grpc.WithTransportCredentials(creds)}, authOpts...)
+	opts = append(opts, activeTrace.dialOptions()...)
 	conn, err := grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", target, err)
@@ -1071,7 +1109,7 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string)
 	}
 
 	targetActor := fmt.Sprintf("%s/%s", task.GetMetadata().GetAtespace(), actor)
-	guestClient, cleanup, err := dialGuest(targetActor, kubeContext, axNamespace)
+	guestClient, cleanup, err := dialGuest(serverURL, targetActor, kubeContext, axNamespace)
 	if err != nil {
 		return err
 	}
@@ -1116,9 +1154,31 @@ func runSSH(serverURL, atespace, kubeContext, axNamespace string, args []string)
 	return nil
 }
 
-func dialGuest(targetActor, kubeContext, axNamespace string) (*guest.Client, func(), error) {
-	// 1. Connect directly to ATENET_ROUTER_ADDR when set (e.g. in-cluster).
+func dialGuest(serverURL, targetActor, kubeContext, axNamespace string) (*guest.Client, func(), error) {
+	// 1. Connect directly to ATENET_ROUTER_ADDR when set (in-cluster or managed router edge).
 	if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
+		if substrate.IsManagedTarget(routerAddr) {
+			target := strings.TrimRight(strings.TrimPrefix(strings.TrimPrefix(routerAddr, "http://"), "https://"), "/")
+			if _, _, err := net.SplitHostPort(target); err != nil {
+				target = net.JoinHostPort(target, "8443")
+			}
+			sni := substrate.HostOnly(target)
+			tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: sni}
+			if pool, err := substrate.LoadManagedCAPool(); err != nil {
+				return nil, nil, err
+			} else if pool != nil {
+				tlsCfg.RootCAs = pool
+			}
+			var extra []grpc.DialOption
+			if tok, err := substrate.ManagedBearerToken(context.Background(), sni); err == nil && tok != "" {
+				extra = append(extra, grpc.WithPerRPCCredentials(staticBearerAuth{token: tok, requireTLS: true}))
+			}
+			client, err := guest.DialTargetTLS(target, targetActor, tlsCfg, extra...)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connecting to guest via managed router at %s: %w", target, err)
+			}
+			return client, nil, nil
+		}
 		addr := strings.TrimPrefix(strings.TrimPrefix(routerAddr, "http://"), "https://")
 		client, err := guest.DialTarget(addr, targetActor)
 		if err != nil {
@@ -1127,7 +1187,18 @@ func dialGuest(targetActor, kubeContext, axNamespace string) (*guest.Client, fun
 		return client, nil, nil
 	}
 
-	// 2. Connect via Substrate atenet-router in ate-system (mTLS on 443, falling back to port 80).
+	// 2. When connected to a remote AX server (no Kubernetes cluster), route
+	// guest gRPC through AX server's managed router proxy.
+	if serverURL != "" && substrate.IsManagedTarget(serverURL) {
+		target, tlsCfg, extra := resolveEndpointDial(serverURL)
+		client, err := guest.DialTargetTLS(target, targetActor, tlsCfg, extra...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("connecting to guest via AX server at %s: %w", target, err)
+		}
+		return client, nil, nil
+	}
+
+	// 3. Connect via Substrate atenet-router in ate-system (mTLS on 443, falling back to port 80).
 	if axNamespace == "" {
 		axNamespace = v1alpha1.DefaultSystemNamespace
 	}

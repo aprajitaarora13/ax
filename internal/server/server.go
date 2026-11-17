@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strings"
 
+	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"github.com/google/ax/internal/apivalidation"
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/lock"
@@ -61,6 +62,7 @@ type Server struct {
 	// task's status owned by its actor, which the store never holds.
 	substrate  *substrate.Client
 	grpcServer *grpc.Server
+	guestProxy *managedGuestProxy
 }
 
 // NewServer creates a new AX API server.
@@ -91,11 +93,14 @@ func NewServer(s store.Store, reconciler *controller.TaskReconciler, opts ...Opt
 		reconciler: reconciler,
 		workspaces: workspaces,
 		substrate:  reconciler.Client(),
+		guestProxy: &managedGuestProxy{},
 	}
 	srv.grpcServer = grpc.NewServer(grpc.StatsHandler(telemetry.ServerStatsHandler(func() map[string]grpc.ServiceInfo {
 		return srv.grpcServer.GetServiceInfo()
 	})))
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
+	ateenvv1alpha.RegisterProcessServiceServer(srv.grpcServer, srv.guestProxy)
+	ateenvv1alpha.RegisterFileSystemServiceServer(srv.grpcServer, srv.guestProxy)
 	return srv
 }
 
@@ -114,6 +119,9 @@ func (s *Server) Handler() http.Handler {
 		if r.URL.Path == "/healthz" {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
+		if s.guestProxy != nil && s.guestProxy.serveTaskPortConnect(w, r) {
 			return
 		}
 		http.NotFound(w, r)

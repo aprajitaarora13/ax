@@ -246,3 +246,46 @@ func TestMetadataServer_MetadataOnlyOnLoopback(t *testing.T) {
 		t.Log("no non-loopback IPv4 address found; skipped the external address check")
 	}
 }
+
+// TestMetadataServer_GRPCOverHTTP1ExplainsDowngrade checks that a gRPC-shaped
+// request that arrives over HTTP/1.1 (for example through a proxy that
+// downgrades the actor leg) gets an explanatory error instead of a bare 404.
+func TestMetadataServer_GRPCOverHTTP1ExplainsDowngrade(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		debug bool
+		want  string
+	}{
+		{name: "debug on", debug: true, want: "guest gRPC requires HTTP/2, got HTTP/1.1"},
+		{name: "debug off", debug: false, want: "guest services disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &v1alpha1.Task{
+				ApiVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindTask,
+				Metadata:   &v1alpha1.ObjectMeta{Name: "t", Atespace: "default"},
+				Spec:       &v1alpha1.TaskSpec{Debug: tc.debug},
+			}
+			srv := metadata.NewServer(0, task, nil, metadata.ServerOptions{WorkspacePath: t.TempDir(), LogDir: t.TempDir()})
+			if err := srv.Start(); err != nil {
+				t.Fatalf("Start() failed: %v", err)
+			}
+			t.Cleanup(func() { _ = srv.Stop(context.Background()) })
+
+			req, err := http.NewRequest(http.MethodPost, "http://"+srv.ProbeAddr()+"/ateenv.v1alpha.ProcessService/StartProcess", strings.NewReader(""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/grpc")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("POST failed: %v", err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(body), tc.want) {
+				t.Errorf("got %d %q, want 404 containing %q", resp.StatusCode, body, tc.want)
+			}
+		})
+	}
+}

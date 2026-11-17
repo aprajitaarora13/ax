@@ -68,6 +68,10 @@ type TaskReconciler struct {
 	// WorkspaceReadyTimeout bounds how long Resume waits for the actor's workspace
 	// to report ready before recording it as still initializing.
 	WorkspaceReadyTimeout time.Duration
+
+	// managedRouterDialContext overrides the TCP dialer used for external managed
+	// routers in unit tests.
+	managedRouterDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // NewTaskReconciler creates a new TaskReconciler. Empty defaults fall back to
@@ -127,6 +131,19 @@ func newProbeHTTPClient() *http.Client {
 		Timeout:   2 * time.Second,
 		Transport: transport,
 	}
+}
+
+func (r *TaskReconciler) managedRouterClient(host string) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if r.managedRouterDialContext != nil {
+		transport.DialContext = r.managedRouterDialContext
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
+	if pool, err := substrate.LoadManagedCAPool(); err == nil && pool != nil {
+		tlsCfg.RootCAs = pool
+	}
+	transport.TLSClientConfig = tlsCfg
+	return &http.Client{Timeout: r.httpClient.Timeout, Transport: transport}
 }
 
 // ensureSubstrateResources resolves the effective Profile and makes sure the
@@ -389,7 +406,8 @@ func (r *TaskReconciler) Resume(ctx context.Context, task *v1alpha1.Task, ws *v1
 	// Workspace setup happens once per task. After it has completed, WorkspaceReady stays
 	// True across suspend/resume cycles, so only poll while it is still initializing.
 	workspaceReady := conditionTrue(task, v1alpha1.ConditionWorkspaceReady)
-	if workerIP != "" && !workspaceReady {
+	routerConfigured := os.Getenv("ATENET_ROUTER_ADDR") != ""
+	if (workerIP != "" || routerConfigured) && !workspaceReady {
 		// Poll briefly for workspace setup completion.
 		pollCtx, cancel := context.WithTimeout(ctx, r.WorkspaceReadyTimeout)
 		defer cancel()
@@ -398,20 +416,22 @@ func (r *TaskReconciler) Resume(ctx context.Context, task *v1alpha1.Task, ws *v1
 		defer ticker.Stop()
 
 		checkReady := func() bool {
-			// 1. Direct readyz check
-			req, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, readyURL, nil)
-			if resp, err := r.httpClient.Do(req); err == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					return true
+			// 1. Direct readyz check (skipped when the actor has no worker pod IP, e.g. microVM sandboxes)
+			if workerIP != "" {
+				req, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, readyURL, nil)
+				if resp, err := r.httpClient.Do(req); err == nil {
+					_ = resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						return true
+					}
 				}
 			}
 
-			// 2. Router-based readyz check (in-cluster via atenet-router)
+			// 2. Router-based readyz check (in-cluster via atenet-router, or external managed router edge)
 			if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
 				routerURL := routerAddr
 				if !strings.HasPrefix(routerURL, "http://") && !strings.HasPrefix(routerURL, "https://") {
-					if strings.HasSuffix(routerURL, ":443") {
+					if strings.HasSuffix(routerURL, ":443") || strings.HasSuffix(routerURL, ":8443") {
 						routerURL = "https://" + routerURL
 					} else {
 						routerURL = "http://" + routerURL
@@ -421,7 +441,15 @@ func (r *TaskReconciler) Resume(ctx context.Context, task *v1alpha1.Task, ws *v1
 				rReq, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, routerURL, nil)
 				if rReq != nil {
 					rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
-					if resp, err := r.httpClient.Do(rReq); err == nil {
+					client := r.httpClient
+					if substrate.IsManagedTarget(rReq.URL.Hostname()) {
+						sni := rReq.URL.Hostname()
+						client = r.managedRouterClient(sni)
+						if tok, err := substrate.ManagedBearerToken(pollCtx, sni); err == nil && tok != "" {
+							rReq.Header.Set("Authorization", "Bearer "+tok)
+						}
+					}
+					if resp, err := client.Do(rReq); err == nil {
 						_ = resp.Body.Close()
 						if resp.StatusCode == http.StatusOK {
 							return true

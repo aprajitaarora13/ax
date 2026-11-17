@@ -53,7 +53,7 @@ func DialTarget(target string, targetActor string) (*Client, error) {
 // DialTargetTLS connects to the guest daemon at the specified target using TLS when
 // tlsConfig is non-nil (or plaintext otherwise), optionally injecting the
 // 'ate-target-actor' metadata header on all calls.
-func DialTargetTLS(target string, targetActor string, tlsConfig *tls.Config) (*Client, error) {
+func DialTargetTLS(target string, targetActor string, tlsConfig *tls.Config, extraOpts ...grpc.DialOption) (*Client, error) {
 	target = strings.TrimPrefix(target, "http://")
 	target = strings.TrimPrefix(target, "https://")
 
@@ -61,7 +61,7 @@ func DialTargetTLS(target string, targetActor string, tlsConfig *tls.Config) (*C
 	if tlsConfig != nil {
 		creds = credentials.NewTLS(tlsConfig)
 	}
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	dialOpts := append([]grpc.DialOption{grpc.WithTransportCredentials(creds)}, extraOpts...)
 	if targetActor != "" {
 		dialOpts = append(dialOpts,
 			grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
