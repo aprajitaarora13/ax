@@ -48,9 +48,9 @@ type Server struct {
 	grpcLoopbackAddr string
 	grpcLoopbackConn *grpc.ClientConn
 	mu               sync.RWMutex
-	task           *v1alpha1.Task
-	workspace      *v1alpha1.Workspace
-	workspaceReady bool
+	task             *v1alpha1.Task
+	workspace        *v1alpha1.Workspace
+	workspaceReady   bool
 }
 
 // ServerOptions configures optional settings for the metadata and guest server.
