@@ -126,13 +126,20 @@ func TestKubeProvisionerProvisionAndDeprovision(t *testing.T) {
 		if strings.Contains(line, "jsonpath={.status.serviceAttachmentURL}") {
 			return "https://www.googleapis.com/compute/v1/projects/prov/regions/us-central1/serviceAttachments/sa1", nil
 		}
+		if strings.Contains(line, "subnets describe") {
+			return "", errors.New("not found")
+		}
+		if strings.Contains(line, "subnets list") {
+			return "10.128.0.0/20\n192.168.0.0/26\n", nil
+		}
 		if strings.Contains(line, "apply -f -") && !strings.Contains(stdin, "kind: ServiceAttachment") {
 			return "", errors.New("apply got no manifests")
 		}
 		return "", nil
 	}
 	p := &KubeProvisioner{Cfg: ProviderConfig{ProviderProject: "prov", Kubeconfig: "kc", CallerGSA: "caller@prov.iam.gserviceaccount.com",
-		SubstrateInstance: "engine", EndpointDomain: "managed-ax.internal"}, Run: run, Poll: time.Millisecond, clock: time.Now}
+		SubstrateInstance: "engine", EndpointDomain: "managed-ax.internal", Network: "default", Region: "us-central1",
+		NATSupernet: "192.168.0.0/16"}, Run: run, Poll: time.Millisecond, clock: time.Now}
 	req := ProvisionRequest{Project: "cust", Location: "us-central1", ID: "demo"}
 	res, err := p.Provision(context.Background(), req)
 	if err != nil {
@@ -147,6 +154,7 @@ func TestKubeProvisionerProvisionAndDeprovision(t *testing.T) {
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{"roles/iam.workloadIdentityUser --member serviceAccount:prov.svc.id.goog[" + ns + "/ax-server]",
+		"subnets create psc-nat-" + ns + " --project prov --network default --region us-central1 --range 192.168.0.64/26 --purpose PRIVATE_SERVICE_CONNECT",
 		"kubectl --kubeconfig kc apply -f -", "rollout status deploy/ax-server"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing call containing %q in:\n%s", want, joined)
@@ -157,8 +165,31 @@ func TestKubeProvisionerProvisionAndDeprovision(t *testing.T) {
 	if err := p.Deprovision(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(calls[0], "delete namespace "+ns) || !strings.Contains(calls[1], "remove-iam-policy-binding") {
+	if !strings.Contains(calls[0], "delete namespace "+ns) || !strings.Contains(calls[1], "remove-iam-policy-binding") ||
+		!strings.Contains(calls[2], "subnets delete psc-nat-"+ns) {
 		t.Errorf("deprovision calls = %v", calls)
+	}
+}
+
+func TestPickFreeRange(t *testing.T) {
+	cases := []struct {
+		used []string
+		want string
+	}{
+		{nil, "192.168.0.0/26"},
+		{[]string{"192.168.0.0/26", "192.168.0.64/26"}, "192.168.0.128/26"},
+		{[]string{"192.168.0.0/24"}, "192.168.1.0/26"},
+		{[]string{"192.168.0.32/28"}, "192.168.0.64/26"},
+		{[]string{"10.128.0.0/9", "garbage"}, "192.168.0.0/26"},
+	}
+	for _, c := range cases {
+		got, err := PickFreeRange("192.168.0.0/16", c.used)
+		if err != nil || got != c.want {
+			t.Errorf("PickFreeRange(%v) = %q, %v; want %q", c.used, got, err, c.want)
+		}
+	}
+	if _, err := PickFreeRange("192.168.0.0/26", []string{"192.168.0.0/26"}); err == nil {
+		t.Error("expected exhaustion error")
 	}
 }
 

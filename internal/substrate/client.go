@@ -156,6 +156,9 @@ func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) 
 			source: NewMetadataIDTokenSource(authority),
 		}))
 	}
+	if managed {
+		dialOpts = append(dialOpts, atespaceScopeDialOptions(managedAtespacePrefix())...)
+	}
 
 	conn, err := grpc.NewClient(opts.Target, dialOpts...)
 	if err != nil {

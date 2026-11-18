@@ -443,6 +443,7 @@ func (r *TaskReconciler) Resume(ctx context.Context, task *v1alpha1.Task, ws *v1
 					rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
 					client := r.httpClient
 					if substrate.IsManagedTarget(rReq.URL.Hostname()) {
+						rReq.Header.Set("ate-target-actor", substrate.ScopeManagedTargetActor(fmt.Sprintf("%s/%s", atespace, actorName)))
 						sni := rReq.URL.Hostname()
 						client = r.managedRouterClient(sni)
 						if tok, err := substrate.ManagedBearerToken(pollCtx, sni); err == nil && tok != "" {

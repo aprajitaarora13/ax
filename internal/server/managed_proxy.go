@@ -96,7 +96,7 @@ func (p *managedGuestProxy) dialActorPort(ctx context.Context, targetActor strin
 	}
 	connectReq := fmt.Sprintf(
 		"CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\nate-target-actor: %s\r\n\r\n",
-		authority, authority, tok, targetActor,
+		authority, authority, tok, substrate.ScopeManagedTargetActor(targetActor),
 	)
 	if _, err := io.WriteString(tlsConn, connectReq); err != nil {
 		_ = tlsConn.Close()

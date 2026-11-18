@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -58,8 +59,75 @@ type ProviderConfig struct {
 	RunnerImage       string
 	EnvoyImage        string
 	PostgresImage     string
-	PSCNATSubnet      string
 	EndpointDomain    string // AX endpoints are <id>-<hash>.<EndpointDomain>
+	// Each PSC service attachment needs its own NAT subnet. They are carved as
+	// /26 ranges out of NATSupernet in Network/Region.
+	Network     string
+	Region      string
+	NATSupernet string
+}
+
+// natSubnetName is the per-instance PSC NAT subnet.
+func natSubnetName(ns string) string { return "psc-nat-" + ns }
+
+// PickFreeRange returns the first /26 in supernet that overlaps none of used.
+func PickFreeRange(supernet string, used []string) (string, error) {
+	_, sn, err := net.ParseCIDR(supernet)
+	if err != nil {
+		return "", err
+	}
+	var usedNets []*net.IPNet
+	for _, u := range used {
+		if _, n, err := net.ParseCIDR(strings.TrimSpace(u)); err == nil {
+			usedNets = append(usedNets, n)
+		}
+	}
+	base := sn.IP.To4()
+	ones, _ := sn.Mask.Size()
+	if base == nil || ones > 26 {
+		return "", fmt.Errorf("supernet %s must be IPv4 and at least a /26", supernet)
+	}
+	start := uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
+	for i := uint32(0); i < 1<<(26-ones); i++ {
+		v := start + i*64
+		ip := net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+		cand := &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(26, 32)}
+		free := true
+		for _, u := range usedNets {
+			if u.Contains(cand.IP) || cand.Contains(u.IP) {
+				free = false
+				break
+			}
+		}
+		if free {
+			return cand.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no free /26 left in %s", supernet)
+}
+
+// ensureNATSubnet creates the instance's PSC NAT subnet if it does not exist.
+func (p *KubeProvisioner) ensureNATSubnet(ctx context.Context, name string) error {
+	gc := []string{"compute", "networks", "subnets"}
+	if _, err := p.Run(ctx, "", "gcloud", append(gc, "describe", name, "--project", p.Cfg.ProviderProject,
+		"--region", p.Cfg.Region, "--format", "value(name)")...); err == nil {
+		return nil
+	}
+	out, err := p.Run(ctx, "", "gcloud", append(gc, "list", "--project", p.Cfg.ProviderProject,
+		"--network", p.Cfg.Network, "--format", "value(ipCidrRange)")...)
+	if err != nil {
+		return fmt.Errorf("list subnets: %w", err)
+	}
+	cidr, err := PickFreeRange(p.Cfg.NATSupernet, strings.Fields(out))
+	if err != nil {
+		return err
+	}
+	if _, err := p.Run(ctx, "", "gcloud", append(gc, "create", name, "--project", p.Cfg.ProviderProject,
+		"--network", p.Cfg.Network, "--region", p.Cfg.Region, "--range", cidr,
+		"--purpose", "PRIVATE_SERVICE_CONNECT", "--quiet")...); err != nil {
+		return fmt.Errorf("create NAT subnet: %w", err)
+	}
+	return nil
 }
 
 // KubeProvisioner creates each AxInstance as a namespace in the provider GKE
@@ -109,10 +177,13 @@ func (p *KubeProvisioner) Provision(ctx context.Context, req ProvisionRequest) (
 		PostgresPass: hex.EncodeToString(pw),
 		EngineHost:   p.Cfg.EngineHost, EngineIP: p.Cfg.EngineIP, EngineCA: p.Cfg.EngineCA,
 		CallerGSA: p.Cfg.CallerGSA, ServerImage: p.Cfg.ServerImage, RunnerImage: p.Cfg.RunnerImage,
-		EnvoyImage: p.Cfg.EnvoyImage, PostgresImage: p.Cfg.PostgresImage, PSCNATSubnet: p.Cfg.PSCNATSubnet,
+		EnvoyImage: p.Cfg.EnvoyImage, PostgresImage: p.Cfg.PostgresImage, PSCNATSubnet: natSubnetName(ns),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("render manifests: %w", err)
+	}
+	if err := p.ensureNATSubnet(ctx, natSubnetName(ns)); err != nil {
+		return nil, err
 	}
 	// Let this instance's ax-server act as the engine caller SA (allowlisted on
 	// the Substrate Instance because it belongs to the provider project).
@@ -173,7 +244,21 @@ func (p *KubeProvisioner) Deprovision(ctx context.Context, req ProvisionRequest)
 		!strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "does not exist") {
 		return fmt.Errorf("remove workload identity binding: %w", err)
 	}
-	return nil
+	// The NAT subnet frees up once GKE deletes the service attachment.
+	var lastErr error
+	for i := 0; i < 30; i++ {
+		_, lastErr = p.Run(ctx, "", "gcloud", "compute", "networks", "subnets", "delete", natSubnetName(ns),
+			"--project", p.Cfg.ProviderProject, "--region", p.Cfg.Region, "--quiet")
+		if lastErr == nil || strings.Contains(lastErr.Error(), "was not found") {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("delete NAT subnet: %w", ctx.Err())
+		case <-time.After(p.Poll):
+		}
+	}
+	return fmt.Errorf("delete NAT subnet: %w", lastErr)
 }
 
 // IAMAuthorizer asks Cloud Resource Manager, with the caller's own access

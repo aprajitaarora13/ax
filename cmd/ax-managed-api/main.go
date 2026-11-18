@@ -59,11 +59,13 @@ func main() {
 		EngineIP:          engineIP,
 		EngineCA:          string(ca),
 		CallerGSA:         "ax-engine-caller@" + providerProject + ".iam.gserviceaccount.com",
-		ServerImage:       registry + "/ax-server@sha256:6f797b721293d894645f6ee7ed0d8a5f688376a2499479e972efa3db65bb9535",
+		ServerImage:       registry + "/ax-server@sha256:71f2c1d9786fa6983b6c80d9a754fc21dbe101ea414b7d70bffc0dffae7a2bd8",
 		RunnerImage:       registry + "/ax-task-runner@sha256:60849a7ce9d150af6d7a7402938f01fb42aea8398505e1a1790aa6e3b36b2214",
 		EnvoyImage:        registry + "/envoy@sha256:6ed0d4f28b8122df896062c425b34f18b8287e8c71c6badb3b84ca2e2f47c519",
 		PostgresImage:     registry + "/postgres@sha256:a2f7e20374cd8fd8ed4a588b79549e10589bea7b1686e77922f5ac741b80b8a1",
-		PSCNATSubnet:      "managed-ax-psc-nat",
+		Network:           "default",
+		Region:            "us-central1",
+		NATSupernet:       "192.168.0.0/16",
 		EndpointDomain:    "us-central1.managed-ax.internal",
 	})
 	srv := managedapi.NewServer(prov, &managedapi.IAMAuthorizer{}, filepath.Join(dir, "state.json"))
